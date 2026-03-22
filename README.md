@@ -11,7 +11,7 @@ Provides **pre** and **post** callbacks around constructor/destructor execution 
 - Supports Android 5.0 - 16 (API 21 - 36)
 - Runtime `soinfo` struct scanning — no hardcoded offsets, works across AOSP and vendor-modified linkers (Samsung, Xiaomi, Huawei, etc.)
 - Self-contained inline hook (`mini_hook.hpp`) — no dependency on Dobby, Substrate, or ShadowHook
-- Only dependency: [xDL](https://github.com/nicksym/xDL) for symbol resolution
+- Only dependency: [xDL](https://github.com/hexhacking/xDL) for symbol resolution
 - Can be built as static library (`.a`), shared library (`.so`), or included directly as source
 
 ## How It Works
