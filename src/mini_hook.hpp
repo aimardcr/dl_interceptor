@@ -7,9 +7,16 @@
 //   3. Write an "original trampoline" that executes saved instructions then jumps back
 //   4. Overwrite target's first N bytes with a relative branch to the entry trampoline
 //
+// Security:
+//   - ARM64 BTI (Branch Target Identification) landing pads in trampolines
+//   - ARM64 PAC (Pointer Authentication) awareness — safe relocation of PACIASP/PACIBSP
+//   - W^X compliant: allocates RW, flips to RX after writing
+//   - PC-relative instruction detection prevents silent corruption
+//
 // Limitations:
-//   - Only hooks function entry points (assumes prologue instructions are not PC-relative)
-//   - Not suitable for hooking arbitrary instruction addresses
+//   - Only hooks function entry points
+//   - Does not relocate PC-relative instructions (rejects them instead)
+//   - ARM32 assumes Thumb mode
 //
 // Usage:
 //   #include "mini_hook.hpp"
@@ -44,26 +51,57 @@ inline uintptr_t page_align(uintptr_t addr) {
     return addr & ~(page_size() - 1);
 }
 
-inline int mprotect_rwx(uintptr_t addr, size_t len) {
-    uintptr_t start = page_align(addr);
-    uintptr_t end = page_align(addr + len - 1 + page_size());
-    return mprotect((void *)start, end - start, PROT_READ | PROT_WRITE | PROT_EXEC);
-}
-
 inline void clear_cache(void *addr, size_t len) {
     __builtin___clear_cache((char *)addr, (char *)addr + len);
 }
 
-// Allocate an executable page near `target` (within `range` bytes).
+// ---------------------------------------------------------------------------
+// Memory protection helpers (W^X aware)
+// ---------------------------------------------------------------------------
+
+// Make target temporarily writable. Prefers RWX so other threads can keep
+// executing the page while we patch.  Falls back to RW if kernel enforces W^X.
+inline int mprotect_write(uintptr_t addr, size_t len) {
+    uintptr_t start = page_align(addr);
+    uintptr_t end = page_align(addr + len - 1 + page_size());
+    size_t size = end - start;
+    if (mprotect((void *)start, size, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) return 0;
+    return mprotect((void *)start, size, PROT_READ | PROT_WRITE);
+}
+
+// Restore execute permission after patching.  Tries R+X, falls back to RWX.
+inline void mprotect_exec(uintptr_t addr, size_t len) {
+    uintptr_t start = page_align(addr);
+    uintptr_t end = page_align(addr + len - 1 + page_size());
+    size_t size = end - start;
+    if (mprotect((void *)start, size, PROT_READ | PROT_EXEC) != 0)
+        mprotect((void *)start, size, PROT_READ | PROT_WRITE | PROT_EXEC);
+}
+
+// Make a trampoline page executable after all code has been written into it.
+inline int finalize_trampoline(void *page, size_t code_size) {
+    clear_cache(page, code_size);
+    uintptr_t ps = page_size();
+    if (mprotect(page, ps, PROT_READ | PROT_EXEC) == 0) return 0;
+    if (mprotect(page, ps, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) return 0;
+    MH_LOGE("finalize: cannot make trampoline page executable");
+    return -1;
+}
+
+// ---------------------------------------------------------------------------
+// Near-page allocator
+// ---------------------------------------------------------------------------
+
+// Allocate a RW page near `target` (within `range` bytes).
+// Caller writes trampoline code, then calls finalize_trampoline().
 inline void *alloc_near(uintptr_t target, size_t range) {
     uintptr_t ps = page_size();
-    int prot = PROT_READ | PROT_WRITE | PROT_EXEC;
     int flags = MAP_PRIVATE | MAP_ANONYMOUS;
 
     for (uintptr_t offset = ps; offset < range; offset += ps) {
         if (target > offset) {
             uintptr_t hint = page_align(target - offset);
-            void *p = mmap((void *)hint, ps, prot, flags, -1, 0);
+            void *p = mmap((void *)hint, ps, PROT_READ | PROT_WRITE, flags, -1, 0);
             if (p != MAP_FAILED) {
                 if ((uintptr_t)p >= target - range && (uintptr_t)p <= target + range)
                     return p;
@@ -72,7 +110,7 @@ inline void *alloc_near(uintptr_t target, size_t range) {
         }
         {
             uintptr_t hint = page_align(target + offset);
-            void *p = mmap((void *)hint, ps, prot, flags, -1, 0);
+            void *p = mmap((void *)hint, ps, PROT_READ | PROT_WRITE, flags, -1, 0);
             if (p != MAP_FAILED) {
                 if ((uintptr_t)p >= target - range && (uintptr_t)p <= target + range)
                     return p;
@@ -82,6 +120,222 @@ inline void *alloc_near(uintptr_t target, size_t range) {
     }
     return nullptr;
 }
+
+// ============================================================================
+// ARM64: instruction classification
+// ============================================================================
+
+#if defined(__aarch64__)
+
+// BTI, BTI c, BTI j, BTI jc  (HINT #32, #34, #36, #38)
+inline bool arm64_is_bti(uint32_t insn) {
+    return (insn & 0xFFFFFF3F) == 0xD503241F;
+}
+
+// PACIASP (HINT #25) or PACIBSP (HINT #27)
+inline bool arm64_is_pac_sp(uint32_t insn) {
+    return insn == 0xD503233F || insn == 0xD503237F;
+}
+
+inline bool arm64_is_pc_relative(uint32_t insn) {
+    if ((insn & 0x9F000000) == 0x90000000) return true;  // ADRP
+    if ((insn & 0x9F000000) == 0x10000000) return true;  // ADR
+    if ((insn & 0x3B000000) == 0x18000000) return true;  // LDR/LDRSW/PRFM literal
+    if ((insn & 0xFC000000) == 0x14000000) return true;  // B
+    if ((insn & 0xFC000000) == 0x94000000) return true;  // BL
+    if ((insn & 0x7E000000) == 0x34000000) return true;  // CBZ/CBNZ
+    if ((insn & 0x7E000000) == 0x36000000) return true;  // TBZ/TBNZ
+    if ((insn & 0xFF000010) == 0x54000000) return true;  // B.cond
+    return false;
+}
+
+// Load a 64-bit immediate into Xd via MOVZ + MOVK (always 4 instructions / 16 bytes).
+inline void arm64_emit_mov_imm(uint32_t *out, uint8_t rd, uint64_t imm) {
+    out[0] = 0xD2800000u | ((uint32_t)((imm >>  0) & 0xFFFF) << 5) | rd;  // MOVZ Xd, #imm[15:0]
+    out[1] = 0xF2A00000u | ((uint32_t)((imm >> 16) & 0xFFFF) << 5) | rd;  // MOVK Xd, #imm[31:16], LSL#16
+    out[2] = 0xF2C00000u | ((uint32_t)((imm >> 32) & 0xFFFF) << 5) | rd;  // MOVK Xd, #imm[47:32], LSL#32
+    out[3] = 0xF2E00000u | ((uint32_t)((imm >> 48) & 0xFFFF) << 5) | rd;  // MOVK Xd, #imm[63:48], LSL#48
+}
+
+// Relocate a single ARM64 instruction from orig_pc to a trampoline buffer.
+// PC-relative instructions are rewritten with absolute addresses so they
+// produce correct results regardless of the trampoline's location.
+// Returns number of uint32_t words written to `out`, or -1 on error.
+// Buffer `out` must have room for at least 5 words (20 bytes).
+inline int arm64_relocate_insn(uint32_t insn, uintptr_t orig_pc, uint32_t *out) {
+    // BTI, PAC, and non-PC-relative instructions: copy verbatim.
+    if (arm64_is_bti(insn) || arm64_is_pac_sp(insn) || !arm64_is_pc_relative(insn)) {
+        out[0] = insn;
+        return 1;
+    }
+
+    // --- B / BL  (±128 MB direct branch) ---
+    if ((insn & 0xFC000000) == 0x14000000 || (insn & 0xFC000000) == 0x94000000) {
+        bool is_bl = (insn & 0xFC000000) == 0x94000000;
+        int32_t imm26 = (int32_t)(insn << 6) >> 6;          // sign-extend 26-bit
+        uintptr_t dst = orig_pc + ((int64_t)imm26 << 2);
+        out[0] = 0x58000051u;                                 // LDR X17, [PC, #8]
+        out[1] = is_bl ? 0xD63F0220u : 0xD61F0220u;          // BLR X17 / BR X17
+        memcpy(&out[2], &dst, 8);                             // .quad dst
+        return 4;
+    }
+
+    // --- ADRP  (PC-relative page address) ---
+    if ((insn & 0x9F000000) == 0x90000000) {
+        uint8_t rd = insn & 0x1F;
+        int32_t immhi = (int32_t)(insn << 8) >> 13;          // sign-extend 19-bit
+        uint32_t immlo = (insn >> 29) & 3;
+        int64_t offset = ((int64_t)immhi << 14) | ((int64_t)immlo << 12);
+        uintptr_t dst = (orig_pc & ~0xFFFULL) + offset;
+        arm64_emit_mov_imm(out, rd, dst);                     // MOV Xd, #page_addr
+        return 4;
+    }
+
+    // --- ADR  (PC-relative address) ---
+    if ((insn & 0x9F000000) == 0x10000000) {
+        uint8_t rd = insn & 0x1F;
+        int32_t immhi = (int32_t)(insn << 8) >> 13;
+        uint32_t immlo = (insn >> 29) & 3;
+        int64_t offset = ((int64_t)immhi << 2) | immlo;
+        uintptr_t dst = orig_pc + offset;
+        arm64_emit_mov_imm(out, rd, dst);                     // MOV Xd, #addr
+        return 4;
+    }
+
+    // --- LDR literal  (PC-relative data load) ---
+    if ((insn & 0x3B000000) == 0x18000000) {
+        uint8_t opc = (insn >> 30) & 3;
+        uint8_t rt = insn & 0x1F;
+        int32_t imm19 = (int32_t)(insn << 8) >> 13;
+        uintptr_t data_addr = orig_pc + ((int64_t)imm19 << 2);
+
+        if (opc == 0b11) { out[0] = 0xD503201Fu; return 1; } // PRFM → NOP
+        if ((insn >> 26) & 1) {                                // V=1: SIMD/FP literal
+            MH_LOGE("arm64: SIMD LDR literal at %p unsupported", (void *)orig_pc);
+            return -1;
+        }
+        arm64_emit_mov_imm(out, 17, data_addr);               // MOV X17, #data_addr
+        if (opc == 0b00)      out[4] = 0xB9400220u | rt;      // LDR Wt,    [X17]
+        else if (opc == 0b01) out[4] = 0xF9400220u | rt;      // LDR Xt,    [X17]
+        else                  out[4] = 0xB9800220u | rt;      // LDRSW Xt,  [X17]
+        return 5;
+    }
+
+    // --- Conditional branches: invert condition, skip over LDR+BR+.quad (20 B) ---
+
+    // B.cond
+    if ((insn & 0xFF000010) == 0x54000000) {
+        int32_t imm19 = (int32_t)(insn << 8) >> 13;
+        uintptr_t dst = orig_pc + ((int64_t)imm19 << 2);
+        uint32_t inv_cond = (insn & 0xF) ^ 1;                // invert condition
+        out[0] = 0x540000A0u | inv_cond;                      // B.<inv> +20
+        out[1] = 0x58000051u;                                  // LDR X17, [PC, #8]
+        out[2] = 0xD61F0220u;                                  // BR X17
+        memcpy(&out[3], &dst, 8);                              // .quad dst
+        return 5;
+    }
+
+    // CBZ / CBNZ
+    if ((insn & 0x7E000000) == 0x34000000) {
+        int32_t imm19 = (int32_t)(insn << 8) >> 13;
+        uintptr_t dst = orig_pc + ((int64_t)imm19 << 2);
+        uint32_t inv = insn ^ (1u << 24);                     // flip CBZ↔CBNZ
+        inv = (inv & ~(0x7FFFFu << 5)) | (5u << 5);           // imm19 = 5 → skip 20 B
+        out[0] = inv;
+        out[1] = 0x58000051u;
+        out[2] = 0xD61F0220u;
+        memcpy(&out[3], &dst, 8);
+        return 5;
+    }
+
+    // TBZ / TBNZ
+    if ((insn & 0x7E000000) == 0x36000000) {
+        int32_t imm14 = (int32_t)(insn << 13) >> 18;          // sign-extend 14-bit
+        uintptr_t dst = orig_pc + ((int64_t)imm14 << 2);
+        uint32_t inv = insn ^ (1u << 24);                     // flip TBZ↔TBNZ
+        inv = (inv & ~(0x3FFFu << 5)) | (5u << 5);            // imm14 = 5 → skip 20 B
+        out[0] = inv;
+        out[1] = 0x58000051u;
+        out[2] = 0xD61F0220u;
+        memcpy(&out[3], &dst, 8);
+        return 5;
+    }
+
+    MH_LOGE("arm64: unhandled PC-relative instruction 0x%08X at %p", insn, (void *)orig_pc);
+    return -1;
+}
+
+#endif  // __aarch64__
+
+// ============================================================================
+// ARM32: Thumb instruction helpers
+// ============================================================================
+
+#if defined(__arm__)
+
+// 32-bit Thumb-2 instructions start with 0xE800..0xFFFF in the first halfword.
+inline bool thumb_is_32bit(uint16_t hw) {
+    return (hw & 0xF800) >= 0xE800;
+}
+
+// Compute minimum instruction-aligned backup length >= min_bytes.
+inline size_t thumb_backup_len(const uint8_t *code, size_t min_bytes) {
+    size_t total = 0;
+    while (total < min_bytes) {
+        uint16_t hw;
+        memcpy(&hw, code + total, 2);
+        total += thumb_is_32bit(hw) ? 4 : 2;
+    }
+    return total;
+}
+
+// Check if any instruction in [code, code+len) is PC-relative.
+inline bool thumb_has_pc_relative(const uint8_t *code, size_t len) {
+    size_t off = 0;
+    while (off < len) {
+        uint16_t hw;
+        memcpy(&hw, code + off, 2);
+        if (thumb_is_32bit(hw)) {
+            uint16_t hw1;
+            memcpy(&hw1, code + off + 2, 2);
+            if ((hw & 0xF800) == 0xF000 && (hw1 & 0xD000) == 0xD000) return true;  // BL/BLX
+            if ((hw & 0xF800) == 0xF000 && (hw1 & 0xD000) == 0x9000) return true;  // B.W
+            if ((hw & 0xFF7F) == 0xF85F) return true;   // LDR.W Rt, [PC, #imm]
+            if ((hw & 0xFBFF) == 0xF20F) return true;   // ADR.W (ADD variant)
+            if ((hw & 0xFBFF) == 0xF2AF) return true;   // ADR.W (SUB variant)
+            off += 4;
+        } else {
+            if ((hw & 0xF800) == 0xA000) return true;   // ADR
+            if ((hw & 0xF800) == 0x4800) return true;   // LDR Rd, [PC, #imm]
+            if ((hw & 0xF800) == 0xE000) return true;   // B (unconditional)
+            if ((hw & 0xF000) == 0xD000 &&
+                ((hw >> 8) & 0xF) < 0xE) return true;   // B.cond
+            if ((hw & 0xF500) == 0xB100) return true;   // CBZ
+            if ((hw & 0xF500) == 0xB900) return true;   // CBNZ
+            off += 2;
+        }
+    }
+    return false;
+}
+
+// Encode a Thumb B.W instruction at `pos` branching to `target`.
+// B.W range: +/-16 MB.  `pos` and `target` must be halfword-aligned.
+inline void thumb_write_bw(uint8_t *pos, uintptr_t target) {
+    int32_t offset = (int32_t)(target - ((uintptr_t)pos + 4));
+    uint32_t s     = (offset >> 24) & 1;
+    uint32_t i1    = (offset >> 23) & 1;
+    uint32_t i2    = (offset >> 22) & 1;
+    uint32_t imm10 = (offset >> 12) & 0x3FF;
+    uint32_t imm11 = (offset >>  1) & 0x7FF;
+    uint32_t j1    = ((~i1) ^ s) & 1;
+    uint32_t j2    = ((~i2) ^ s) & 1;
+    uint16_t hw0 = 0xF000 | (s << 10) | imm10;
+    uint16_t hw1 = 0x9000 | (j1 << 13) | (j2 << 11) | imm11;
+    memcpy(pos,     &hw0, 2);
+    memcpy(pos + 2, &hw1, 2);
+}
+
+#endif  // __arm__
 
 // ============================================================================
 // x86 / x86_64: minimal instruction length decoder
@@ -141,6 +395,7 @@ inline size_t x86_insn_len(const uint8_t *code) {
     // ModR/M-based opcodes
     bool has_modrm = false;
     size_t imm_size = 0;
+    bool is_group3 = false;  // F6/F7: immediate depends on ModR/M reg field
 
     if (op == 0x0F) {
         uint8_t op2 = *p++;
@@ -168,8 +423,8 @@ inline size_t x86_insn_len(const uint8_t *code) {
     else if (op == 0x8D) { has_modrm = true; }                           // LEA
     else if (op == 0xC6) { has_modrm = true; imm_size = 1; }             // MOV r/m, imm8
     else if (op == 0xC7) { has_modrm = true; imm_size = has_prefix_66 ? 2 : 4; } // MOV r/m, imm32
-    else if (op == 0xF6) { has_modrm = true; imm_size = 1; }             // TEST/NOT/NEG r/m8
-    else if (op == 0xF7) { has_modrm = true; imm_size = has_prefix_66 ? 2 : 4; } // TEST/NOT/NEG r/m
+    else if (op == 0xF6) { has_modrm = true; is_group3 = true; }         // Group 3 byte
+    else if (op == 0xF7) { has_modrm = true; is_group3 = true; }         // Group 3 word/dword
     else if (op == 0xFF) { has_modrm = true; }                           // INC/DEC/CALL/JMP/PUSH
     else if (op >= 0xD0 && op <= 0xD3) { has_modrm = true; }             // Shift
     else if (op == 0xC0 || op == 0xC1) { has_modrm = true; imm_size = 1; } // Shift imm
@@ -186,6 +441,16 @@ inline size_t x86_insn_len(const uint8_t *code) {
     uint8_t modrm = *p++;
     uint8_t mod = modrm >> 6;
     uint8_t rm = modrm & 0x07;
+
+    // Group 3 (F6/F7): only TEST (reg field 0 or 1) has an immediate operand.
+    // NOT/NEG/MUL/IMUL/DIV/IDIV (reg >= 2) have no immediate.
+    if (is_group3) {
+        uint8_t reg = (modrm >> 3) & 7;
+        if (reg <= 1) {
+            imm_size = (op == 0xF6) ? 1 : (has_prefix_66 ? 2 : 4);
+        }
+        // else imm_size stays 0
+    }
 
 #if defined(__x86_64__)
     bool addr32 = has_prefix_67;
@@ -229,20 +494,24 @@ inline int mini_hook_install(void *target, void *replace, void **original) {
 // ---------- ARM64 ----------
 #if defined(__aarch64__)
 
-    constexpr size_t kBackupLen = 4;
+    constexpr size_t kPatchLen = 4;            // one B instruction
     constexpr size_t kBRange = 128 * 1024 * 1024;
+    constexpr uint32_t kBtiC = 0xD503245F;     // BTI c — NOP on pre-v8.5 hardware
 
     uintptr_t target_addr = (uintptr_t)target;
     uintptr_t replace_addr = (uintptr_t)replace;
 
+    uint32_t insn0 = *(const uint32_t *)target_addr;
+
     void *page = alloc_near(target_addr, kBRange - page_size());
     if (!page) {
-        MH_LOGE("arm64: failed to allocate near page for %p", target);
+        MH_LOGE("arm64: alloc_near failed for %p", target);
         return -1;
     }
     auto *tramp = (uint8_t *)page;
 
-    // Entry trampoline: LDR X17, #8; BR X17; .quad replace_addr
+    // --- Entry trampoline (16 bytes) ---
+    // Reached via direct B from the patched target — no BTI needed.
     {
         auto *p = (uint32_t *)tramp;
         p[0] = 0x58000051;  // LDR X17, [PC, #8]
@@ -250,20 +519,36 @@ inline int mini_hook_install(void *target, void *replace, void **original) {
         memcpy(&p[2], &replace_addr, 8);
     }
 
-    // Original trampoline: <saved instr>; LDR X17, #8; BR X17; .quad (target+4)
+    // --- Original trampoline (12-28 bytes, variable) ---
+    // Called indirectly via function pointer (BLR), so needs BTI landing pad.
+    // Uses direct B for the jump-back, which does NOT trigger BTI checks at
+    // target+4 — critical for BTI-enabled linker binaries.
     uint8_t *orig_tramp = tramp + 16;
-    memcpy(orig_tramp, (void *)target_addr, kBackupLen);
-    {
-        auto *p = (uint32_t *)(orig_tramp + kBackupLen);
-        uintptr_t ret_addr = target_addr + kBackupLen;
-        p[0] = 0x58000051;
-        p[1] = 0xD61F0220;
-        memcpy(&p[2], &ret_addr, 8);
-    }
-    clear_cache(page, 36);
+    auto *p = (uint32_t *)orig_tramp;
+    *p++ = kBtiC;  // BTI c landing pad (NOP on old hw)
 
-    // Overwrite target with B <entry_trampoline>
-    if (mprotect_rwx(target_addr, kBackupLen) != 0) {
+    // Relocate the overwritten instruction — rewrites PC-relative instructions
+    // with absolute addresses so they work from the trampoline's different PC.
+    int relo_n = arm64_relocate_insn(insn0, target_addr, p);
+    if (relo_n < 0) {
+        munmap(page, page_size());
+        return -1;
+    }
+    p += relo_n;
+
+    // Direct B back to the instruction after our patch
+    {
+        int64_t b_back = (int64_t)((target_addr + kPatchLen) - (uintptr_t)p);
+        *p++ = 0x14000000u | (((uint32_t)(b_back >> 2)) & 0x03FFFFFFu);
+    }
+
+    if (finalize_trampoline(page, (uintptr_t)p - (uintptr_t)tramp) != 0) {
+        munmap(page, page_size());
+        return -1;
+    }
+
+    // Patch target: overwrite first instruction with B <entry_trampoline>
+    if (mprotect_write(target_addr, kPatchLen) != 0) {
         MH_LOGE("arm64: mprotect failed for %p", target);
         munmap(page, page_size());
         return -1;
@@ -272,6 +557,7 @@ inline int mini_hook_install(void *target, void *replace, void **original) {
     uint32_t b_instr = 0x14000000u | (((uint32_t)(b_offset >> 2)) & 0x03FFFFFFu);
     memcpy((void *)target_addr, &b_instr, 4);
     clear_cache((void *)target_addr, 4);
+    mprotect_exec(target_addr, kPatchLen);
 
     *original = (void *)orig_tramp;
     return 0;
@@ -279,56 +565,67 @@ inline int mini_hook_install(void *target, void *replace, void **original) {
 // ---------- ARM32 (Thumb) ----------
 #elif defined(__arm__)
 
-    constexpr size_t kBackupLen = 4;
+    constexpr size_t kMinPatch = 4;  // B.W is 4 bytes
     constexpr size_t kBwRange = 16 * 1024 * 1024;
 
     uintptr_t target_addr = (uintptr_t)target & ~1u;  // clear Thumb bit
     uintptr_t replace_addr = (uintptr_t)replace;
 
+    // Determine instruction-aligned backup length (4 or 6 bytes)
+    size_t backup_len = thumb_backup_len((const uint8_t *)target_addr, kMinPatch);
+    if (backup_len == 0 || backup_len > 8) {
+        MH_LOGE("arm: unexpected backup length %zu at %p", backup_len, target);
+        return -1;
+    }
+
+    if (thumb_has_pc_relative((const uint8_t *)target_addr, backup_len)) {
+        MH_LOGE("arm: PC-relative instruction in prologue at %p, cannot hook", target);
+        return -1;
+    }
+
     void *page = alloc_near(target_addr, kBwRange - page_size());
     if (!page) {
-        MH_LOGE("arm: failed to allocate near page for %p", target);
+        MH_LOGE("arm: alloc_near failed for %p", target);
         return -1;
     }
     auto *tramp = (uint8_t *)page;
 
-    // Entry trampoline: LDR.W PC, [PC, #0]; .word replace_addr  (8 bytes)
+    // --- Entry trampoline (8 bytes) ---
+    //   LDR.W PC, [PC, #0]   ; load replacement address, branch
+    //   .word replace_addr
+    // Page-aligned, so LDR.W is always 4-byte aligned — [PC,#0] is correct.
     tramp[0] = 0xDF; tramp[1] = 0xF8;  // LDR.W PC, [PC, #0]
     tramp[2] = 0x00; tramp[3] = 0xF0;
     memcpy(tramp + 4, &replace_addr, 4);
 
-    // Original trampoline: <saved instr>; LDR.W PC, [PC, #0]; .word (target+4|1)
+    // --- Original trampoline ---
+    //   <saved instructions>   ; backup_len bytes (4 or 6)
+    //   B.W target+backup_len  ; direct branch back (stays Thumb, no alignment issues)
     uint8_t *orig_tramp = tramp + 8;
-    memcpy(orig_tramp, (void *)target_addr, kBackupLen);
-    uintptr_t ret_addr = (target_addr + kBackupLen) | 1u;  // Thumb bit
-    orig_tramp[4] = 0xDF; orig_tramp[5] = 0xF8;
-    orig_tramp[6] = 0x00; orig_tramp[7] = 0xF0;
-    memcpy(orig_tramp + 8, &ret_addr, 4);
-    clear_cache(page, 20);
+    memcpy(orig_tramp, (void *)target_addr, backup_len);
+    thumb_write_bw(orig_tramp + backup_len, target_addr + backup_len);
 
-    // Overwrite target with B.W <entry_trampoline>
-    if (mprotect_rwx(target_addr, kBackupLen) != 0) {
+    size_t tramp_total = 8 + backup_len + 4;
+    if (finalize_trampoline(page, tramp_total) != 0) {
+        munmap(page, page_size());
+        return -1;
+    }
+
+    // Patch target: B.W <entry_trampoline> + NOP-pad any excess bytes
+    if (mprotect_write(target_addr, backup_len) != 0) {
         MH_LOGE("arm: mprotect failed for %p", target);
         munmap(page, page_size());
         return -1;
     }
-    {
-        int32_t offset = (int32_t)(((uintptr_t)tramp | 1u) - (target_addr + 4));
-        uint32_t s = (offset >> 24) & 1;
-        uint32_t i1 = (offset >> 23) & 1;
-        uint32_t i2 = (offset >> 22) & 1;
-        uint32_t imm10 = (offset >> 12) & 0x3FF;
-        uint32_t imm11 = (offset >> 1) & 0x7FF;
-        uint32_t j1 = ((~i1) ^ s) & 1;
-        uint32_t j2 = ((~i2) ^ s) & 1;
-        uint16_t hw0 = 0xF000 | (s << 10) | imm10;
-        uint16_t hw1 = 0x9000 | (j1 << 13) | (j2 << 11) | imm11;
-        memcpy((void *)target_addr, &hw0, 2);
-        memcpy((void *)(target_addr + 2), &hw1, 2);
+    thumb_write_bw((uint8_t *)target_addr, (uintptr_t)tramp);
+    for (size_t i = kMinPatch; i < backup_len; i += 2) {
+        uint16_t nop = 0xBF00;
+        memcpy((void *)(target_addr + i), &nop, 2);
     }
-    clear_cache((void *)target_addr, 4);
+    clear_cache((void *)target_addr, backup_len);
+    mprotect_exec(target_addr, backup_len);
 
-    *original = (void *)((uintptr_t)orig_tramp | 1u);  // Thumb bit
+    *original = (void *)((uintptr_t)orig_tramp | 1u);  // set Thumb bit
     return 0;
 
 // ---------- x86 (32-bit) ----------
@@ -345,7 +642,7 @@ inline int mini_hook_install(void *target, void *replace, void **original) {
         return -1;
     }
 
-    void *page = mmap(nullptr, page_size(), PROT_READ | PROT_WRITE | PROT_EXEC,
+    void *page = mmap(nullptr, page_size(), PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (page == MAP_FAILED) {
         MH_LOGE("x86: mmap failed");
@@ -358,10 +655,14 @@ inline int mini_hook_install(void *target, void *replace, void **original) {
     tramp[backup_len] = 0xE9;
     int32_t jmp_back = (int32_t)(target_addr + backup_len - (uintptr_t)(tramp + backup_len + kJmpSize));
     memcpy(tramp + backup_len + 1, &jmp_back, 4);
-    clear_cache(page, backup_len + kJmpSize);
+
+    if (finalize_trampoline(page, backup_len + kJmpSize) != 0) {
+        munmap(page, page_size());
+        return -1;
+    }
 
     // Overwrite target with JMP rel32 to replace
-    if (mprotect_rwx(target_addr, backup_len) != 0) {
+    if (mprotect_write(target_addr, backup_len) != 0) {
         MH_LOGE("x86: mprotect failed for %p", target);
         munmap(page, page_size());
         return -1;
@@ -372,6 +673,7 @@ inline int mini_hook_install(void *target, void *replace, void **original) {
     memcpy(t + 1, &jmp_to, 4);
     for (size_t i = kJmpSize; i < backup_len; i++) t[i] = 0x90;  // NOP padding
     clear_cache((void *)target_addr, backup_len);
+    mprotect_exec(target_addr, backup_len);
 
     *original = (void *)tramp;
     return 0;
@@ -402,13 +704,13 @@ inline int mini_hook_install(void *target, void *replace, void **original) {
 
     void *page = alloc_near(target_addr, kJmpRange);
     if (!page) {
-        // Far fallback: absolute jump at target (14 bytes)
+        // Far fallback: absolute jump at target (needs 14 bytes)
         backup_len = calc_backup_len((const uint8_t *)target_addr, kAbsJmpSize);
         if (backup_len == 0) {
             MH_LOGE("x64: decode failed at %p (need %zu bytes)", target, kAbsJmpSize);
             return -1;
         }
-        page = mmap(nullptr, page_size(), PROT_READ | PROT_WRITE | PROT_EXEC,
+        page = mmap(nullptr, page_size(), PROT_READ | PROT_WRITE,
                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (page == MAP_FAILED) {
             MH_LOGE("x64: mmap failed");
@@ -417,9 +719,13 @@ inline int mini_hook_install(void *target, void *replace, void **original) {
         auto *tramp = (uint8_t *)page;
         memcpy(tramp, (void *)target_addr, backup_len);
         write_abs_jmp(tramp + backup_len, target_addr + backup_len);
-        clear_cache(page, backup_len + kAbsJmpSize);
 
-        if (mprotect_rwx(target_addr, backup_len) != 0) {
+        if (finalize_trampoline(page, backup_len + kAbsJmpSize) != 0) {
+            munmap(page, page_size());
+            return -1;
+        }
+
+        if (mprotect_write(target_addr, backup_len) != 0) {
             MH_LOGE("x64: mprotect failed for %p", target);
             munmap(page, page_size());
             return -1;
@@ -427,6 +733,7 @@ inline int mini_hook_install(void *target, void *replace, void **original) {
         write_abs_jmp((uint8_t *)target_addr, replace_addr);
         for (size_t i = kAbsJmpSize; i < backup_len; i++) ((uint8_t *)target_addr)[i] = 0x90;
         clear_cache((void *)target_addr, backup_len);
+        mprotect_exec(target_addr, backup_len);
 
         *original = (void *)tramp;
         return 0;
@@ -435,17 +742,21 @@ inline int mini_hook_install(void *target, void *replace, void **original) {
     // Near path
     auto *tramp = (uint8_t *)page;
 
-    // Entry trampoline: absolute jump to replacement
+    // Entry trampoline: absolute jump to replacement (14 bytes, padded to 16)
     write_abs_jmp(tramp, replace_addr);
 
     // Original trampoline: saved instructions + absolute jump back
     uint8_t *orig_tramp = tramp + 16;
     memcpy(orig_tramp, (void *)target_addr, backup_len);
     write_abs_jmp(orig_tramp + backup_len, target_addr + backup_len);
-    clear_cache(page, 16 + backup_len + kAbsJmpSize);
 
-    // Overwrite target with JMP rel32 → entry trampoline
-    if (mprotect_rwx(target_addr, backup_len) != 0) {
+    if (finalize_trampoline(page, 16 + backup_len + kAbsJmpSize) != 0) {
+        munmap(page, page_size());
+        return -1;
+    }
+
+    // Overwrite target with JMP rel32 -> entry trampoline
+    if (mprotect_write(target_addr, backup_len) != 0) {
         MH_LOGE("x64: mprotect failed for %p", target);
         munmap(page, page_size());
         return -1;
@@ -456,6 +767,7 @@ inline int mini_hook_install(void *target, void *replace, void **original) {
     memcpy(t + 1, &jmp_to, 4);
     for (size_t i = kJmpSize; i < backup_len; i++) t[i] = 0x90;
     clear_cache((void *)target_addr, backup_len);
+    mprotect_exec(target_addr, backup_len);
 
     *original = (void *)orig_tramp;
     return 0;

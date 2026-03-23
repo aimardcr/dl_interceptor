@@ -7,7 +7,7 @@
 // linker to provide callbacks before and after ELF initialization/finalization.
 //
 // Supports: Android 5.0+ (API 21+), armeabi-v7a, arm64-v8a, x86, x86_64
-// Dependencies: DobbyHook (inline hooking), xDL (symbol resolution)
+// Dependencies: mini_hook (inline hooking), xDL (symbol resolution)
 
 #pragma once
 
